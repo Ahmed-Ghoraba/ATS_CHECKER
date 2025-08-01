@@ -1,95 +1,168 @@
-import sys
+import os
+import io
+import zipfile
+from flask import Flask, request, render_template_string, send_file
 import utils
-import email_service
-import streamlit as st
-from io import StringIO
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
-# Capture debug logs
-sys.stdout = StringIO() 
-st.set_page_config(page_title="HR ∙ ATS")
+app = Flask(__name__)
 
-def main():
-    st.title("HR | ATS")
-    st.markdown("---")
+# HTML Template (inline)
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ATS Resume Checker</title>
+    <style>
+        body { font-family: Arial; max-width: 800px; margin: auto; padding: 20px; }
+        h1, h2 { color: #333; }
+        form { margin-bottom: 20px; }
+        .feedback { border: 1px solid #ccc; padding: 10px; margin: 10px 0; }
+        .passed { background: #e1f5e1; }
+        .failed { background: #fce4e4; }
+    </style>
+</head>
+<body>
+    <h1>ATS Resume Checker</h1>
+    <form method="POST" enctype="multipart/form-data">
+        <label>Job Description:</label><br>
+        <textarea name="job_desc" rows="6" cols="70">{{ job_desc or '' }}</textarea><br><br>
 
-    st.subheader("Job Description and ATS Criteria")
-    st.write("Please provide the job description and set the ATS criteria for filtering resumes.")
+        <label>Min Experience:</label>
+        <input type="number" name="min_exp" value="{{ min_exp or 1 }}"><br><br>
 
-    description = st.text_area("Job Description:", key="input", height=150)
-    min_experience = st.number_input("Minimum Years of Experience:", min_value=0, max_value=50, value=1, step=1)
-    max_experience = st.number_input("Maximum Years of Experience:", min_value=0, max_value=50, value=3, step=1)
-    ats_criteria = st.number_input("Enter ATS Score Criteria (difficulty level):", min_value=0, max_value=100, value=65, step=1)
+        <label>Max Experience:</label>
+        <input type="number" name="max_exp" value="{{ max_exp or 3 }}"><br><br>
 
-    st.markdown("---")
-    st.subheader("Upload Resumes")
-    uploaded_files = st.file_uploader("Upload your resumes (PDF or DOCX)...", type=["pdf", "docx"], accept_multiple_files=True)
+        <label>ATS Score Criteria:</label>
+        <input type="number" name="ats_criteria" value="{{ ats_criteria or 75 }}"><br><br>
 
-    if uploaded_files:
-        st.success(f"{len(uploaded_files)} file(s) uploaded successfully.")
+        <label>Upload Resumes:</label>
+        <input type="file" name="resumes" multiple><br><br>
 
-    submit = st.button("Process Resumes")
-    st.markdown("---")
-    if submit:
-        if not description:
-            st.error("Please provide a job description before processing resumes.")
-        elif not uploaded_files:
-            st.error("Please upload at least one resume to proceed.")
-        else:
-            process_resumes(description, ats_criteria, uploaded_files, min_experience, max_experience)
-            
-    with st.expander("Show Debug Logs"):
-        captured_output = sys.stdout.getvalue()
-        st.text_area("Debug Logs", captured_output, height=150)
+        <button type="submit">Process Resumes</button>
+    </form>
 
+    {% if error %}
+        <div style="color:red; margin-bottom:20px;">{{ error }}</div>
+    {% endif %}
 
-def process_resumes(description, ats_criteria, uploaded_files, min_experience, max_experience):
-    proceed_resumes = []
-    
-    for uploaded_file in uploaded_files:
-        pdf_content = utils.file_to_text(uploaded_file)
-        if not pdf_content:
-            st.warning(f"Rejected: {uploaded_file.name} (Empty or unreadable)")
-            continue
+    {% if results %}
+        <h2>Results</h2>
+        {% for result in results %}
+            <div class="feedback {% if result.passed %}passed{% else %}failed{% endif %}">
+                <b>{{ result.name }}</b><br>
+                ATS Score: {{ result.score }}%<br>
+                <i>{{ result.feedback }}</i>
+            </div>
+        {% endfor %}
 
-        # Updated prompt to request feedback and decision
-        prompt = utils.get_prompt_with_feedback(pdf_content, description, min_experience, max_experience, ats_criteria)
-        ats_score, feedback = utils.get_ats_score_and_feedback(prompt=prompt, file_name=uploaded_file.name)
+        {% if zip_ready %}
+            <form method="GET" action="/download">
+                <button type="submit">Download Shortlisted Resumes as ZIP</button>
+            </form>
+        {% endif %}
+    {% endif %}
+</body>
+</html>
+"""
 
-        if ats_score is None:
-            st.error(f"Error processing {uploaded_file.name}")
-            continue
+shortlisted_resumes = []
 
-        # Show result per resume on frontend
-        decision_text = "✅ ACCEPTED" if ats_score >= int(ats_criteria) else "❌ REJECTED"
-        decision_color = "green" if ats_score >= int(ats_criteria) else "red"
+@app.route("/", methods=["GET", "POST"])
+def index():
+    global shortlisted_resumes
+    results = []
+    zip_ready = False
+    error = None
 
-        st.markdown(f"### **{uploaded_file.name}** - <span style='color:{decision_color}'>{decision_text}</span> (ATS Score: {ats_score}%)", unsafe_allow_html=True)
-        st.markdown(f"**Feedback:**\n\n{feedback}")
+    if request.method == "POST":
+        job_desc = request.form.get("job_desc", "")
+        min_exp = int(request.form.get("min_exp", 1))
+        max_exp = int(request.form.get("max_exp", 3))
+        ats_criteria = int(request.form.get("ats_criteria", 75))
+        uploaded_files = request.files.getlist("resumes")
 
-        if ats_score >= int(ats_criteria):
-            proceed_resumes.append({
-                "Name": uploaded_file.name,
-                "Score": ats_score,
-                "Feedback": feedback,
-                "Resume": uploaded_file.name,
-                "ResumeFile": uploaded_file
+        if not job_desc.strip():
+            error = "Please provide a job description before processing resumes."
+            return render_template_string(HTML_TEMPLATE, results=None, error=error)
+
+        if len(uploaded_files) == 0:
+            error = "Please upload at least one resume to proceed."
+            return render_template_string(HTML_TEMPLATE, results=None, error=error)
+
+        shortlisted_resumes = []
+        for uploaded_file in uploaded_files:
+            file_name = uploaded_file.filename
+            pdf_content = utils.file_to_text(uploaded_file)
+
+            if not pdf_content:
+                results.append({
+                    "name": file_name,
+                    "score": 0,
+                    "feedback": "Rejected: Empty or unreadable resume.",
+                    "passed": False
+                })
+                continue
+
+            prompt = utils.get_prompt_with_feedback(pdf_content, job_desc, min_exp, max_exp)
+            ats_score, feedback = utils.get_ats_score_and_feedback(prompt, file_name)
+
+            if ats_score < ats_criteria:
+                results.append({
+                    "name": file_name,
+                    "score": ats_score,
+                    "feedback": f"Rejected: ATS score {ats_score}% is below threshold.",
+                    "passed": False
+                })
+                continue
+
+            results.append({
+                "name": file_name,
+                "score": ats_score,
+                "feedback": f"Accepted: {feedback}",
+                "passed": True
             })
 
-    # Allow download of shortlisted resumes
-    if len(proceed_resumes) != 0:
-        zip_buffer = utils.create_zip_file(proceed_resumes)
-        current_date_str = utils.get_day_month_year()
-        if zip_buffer: 
-            st.download_button(
-                label="Download Shortlisted Resumes as ZIP",
-                data=zip_buffer,
-                file_name=f"shortlisted-resumes-{current_date_str}.zip",
-                mime="application/zip"
-            )
+            shortlisted_resumes.append({"name": file_name, "file": uploaded_file})
 
+        if len(shortlisted_resumes) > 0:
+            zip_ready = True
+
+        return render_template_string(
+            HTML_TEMPLATE,
+            results=results,
+            zip_ready=zip_ready,
+            job_desc=job_desc,
+            min_exp=min_exp,
+            max_exp=max_exp,
+            ats_criteria=ats_criteria
+        )
+
+    return render_template_string(HTML_TEMPLATE, results=None)
+
+@app.route("/download", methods=["GET"])
+def download_zip():
+    global shortlisted_resumes
+    if len(shortlisted_resumes) == 0:
+        return render_template_string(HTML_TEMPLATE, results=None, error="No shortlisted resumes to download.")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        for res in shortlisted_resumes:
+            res["file"].seek(0)
+            zipf.writestr(res["name"], res["file"].read())
+    zip_buffer.seek(0)
+
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="shortlisted-resumes.zip"
+    )
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
