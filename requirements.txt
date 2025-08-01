@@ -1,29 +1,22 @@
-# Core tools (make sure they are up-to-date)
+# Force stable Python environment
 pip>=25.0
 setuptools>=70.0.0
 wheel>=0.42.0
 
-# Streamlit
+# Core
 streamlit>=1.36.0
-
-# Google Gemini (Generative AI API)
 google-generativeai>=0.7.2
 google-api-core>=2.19.1
 
-# PDF handling
+# File processing
 pdfplumber>=0.11.0
 PyPDF2>=3.0.1
-
-# DOCX handling (for future support)
 python-docx>=1.1.2
 
-# Data handling & utils
+# Data handling
 pandas>=2.2.2
 numpy>=1.26.4
 python-dotenv>=1.0.1
 
-# Email (SMTP) support
-smtplib-client>=1.0.0
-
-# Archiving & file utilities
+# Requests for API/email handling
 requests>=2.32.3
